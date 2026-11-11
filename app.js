@@ -80,8 +80,12 @@ function createKnockoutRounds(teamIds, stage = "knockout", startingRound = 1) {
   const size = 2 ** Math.ceil(Math.log2(teamIds.length));
   const roundsCount = Math.log2(size);
   const matches = [];
-  const slots = new Array(size).fill(null);
-  teamIds.forEach((teamId, index) => { slots[index] = teamId; });
+  const slots = [];
+  const byeCount = size - teamIds.length;
+  for (let index = 0; index < byeCount; index += 1) {
+    slots.push(teamIds[index], null);
+  }
+  slots.push(...teamIds.slice(byeCount));
 
   for (let round = 1; round <= roundsCount; round += 1) {
     const matchCount = size / (2 ** round);
@@ -113,23 +117,24 @@ function createKnockoutRounds(teamIds, stage = "knockout", startingRound = 1) {
 function advanceWinners(matches, stage) {
   const stageMatches = matches.filter((match) => (match.stage || "knockout") === stage);
   const roundNumbers = [...new Set(stageMatches.map((match) => match.round))].sort((a, b) => a - b);
+  const resolved = new Map();
+  const firstRound = stageMatches.filter((match) => match.round === roundNumbers[0]);
+  for (const match of firstRound) {
+    resolved.set(match.id, match.status === "complete" || (!match.team1Id && !match.team2Id));
+  }
   for (const round of roundNumbers) {
     const currentRound = stageMatches.filter((match) => match.round === round);
     const nextRound = stageMatches.filter((match) => match.round === round + 1);
     if (!nextRound.length) continue;
-    for (const match of currentRound) {
-      if (match.status !== "complete") continue;
-      const winner = Number(match.score1) > Number(match.score2) ? match.team1Id : match.team2Id;
-      const next = nextRound.find((candidate) => candidate.matchIndex === Math.floor(match.matchIndex / 2));
-      if (!next) continue;
-      if (match.matchIndex % 2 === 0) next.advancedTeam1Id = winner;
-      else next.advancedTeam2Id = winner;
-    }
     for (const next of nextRound) {
-      const team1Id = next.advancedTeam1Id || null;
-      const team2Id = next.advancedTeam2Id || null;
-      delete next.advancedTeam1Id;
-      delete next.advancedTeam2Id;
+      const source1 = currentRound.find((match) => match.matchIndex === next.matchIndex * 2);
+      const source2 = currentRound.find((match) => match.matchIndex === next.matchIndex * 2 + 1);
+      const winner = (match) => match && match.status === "complete"
+        ? (Number(match.score1) > Number(match.score2) ? match.team1Id : match.team2Id)
+        : null;
+      const team1Id = winner(source1);
+      const team2Id = winner(source2);
+      const sourcesResolved = source1 && source2 && resolved.get(source1.id) && resolved.get(source2.id);
       if (next.team1Id !== team1Id || next.team2Id !== team2Id) {
         next.team1Id = team1Id;
         next.team2Id = team2Id;
@@ -137,16 +142,32 @@ function advanceWinners(matches, stage) {
         next.score1 = null;
         next.score2 = null;
       }
-      if (next.status !== "complete" && Boolean(next.team1Id) !== Boolean(next.team2Id)) {
+      if (sourcesResolved && Boolean(next.team1Id) !== Boolean(next.team2Id)) {
         next.status = "complete";
         next.score1 = next.team1Id ? 1 : 0;
         next.score2 = next.team2Id ? 1 : 0;
+      } else if (!sourcesResolved && (!next.team1Id || !next.team2Id)) {
+        next.status = "pending";
+        next.score1 = null;
+        next.score2 = null;
       }
+      resolved.set(next.id, Boolean(sourcesResolved && (next.status === "complete" || (!team1Id && !team2Id))));
     }
   }
 }
 
-function makeTournament(name, format, teamNames) {
+function groupLabel(index) {
+  let number = index + 1;
+  let label = "";
+  while (number > 0) {
+    number -= 1;
+    label = String.fromCharCode(65 + number % 26) + label;
+    number = Math.floor(number / 26);
+  }
+  return label;
+}
+
+function makeTournament(name, format, teamNames, groupCount) {
   const teams = teamNames.map((teamName) => ({ id: createId(), name: teamName }));
   const tournament = {
     id: createId(),
@@ -164,12 +185,10 @@ function makeTournament(name, format, teamNames) {
   } else if (format === "knockout") {
     tournament.matches = createKnockoutRounds(teams.map((team) => team.id));
   } else {
-    const groupCount = teams.length >= 10 ? 4 : 2;
-    const groups = Array.from({ length: groupCount }, (_, index) => ({
-      id: String.fromCharCode(65 + index),
-      name: `Girone ${String.fromCharCode(65 + index)}`,
-      teamIds: []
-    }));
+    const groups = Array.from({ length: groupCount }, (_, index) => {
+      const id = groupLabel(index);
+      return { id, name: `Girone ${id}`, teamIds: [] };
+    });
     teams.forEach((team, index) => groups[index % groupCount].teamIds.push(team.id));
     tournament.groups = groups;
     tournament.matches = groups.flatMap((group) => buildRoundRobin(group.teamIds, group.id));
@@ -255,6 +274,11 @@ function renderHome() {
               <option value="groups_knockout">Gironi + eliminazione diretta</option>
             </select>
           </div>
+          <div class="form-field" id="group-count-field" hidden>
+            <label for="group-count">Numero di gironi</label>
+            <input id="group-count" name="groupCount" type="number" min="2" step="1" value="2" inputmode="numeric" disabled aria-describedby="group-count-hint">
+            <p class="form-hint" id="group-count-hint">Almeno 2 gironi e 2 squadre per girone. Le prime 2 di ogni girone accedono alla fase finale.</p>
+          </div>
           <div class="form-field">
             <label for="team-names">Squadre</label>
             <textarea id="team-names" name="teams" placeholder="Una squadra per riga&#10;Es.&#10;I Fulmini&#10;Gli Invincibili&#10;Palla al Centro" required></textarea>
@@ -277,6 +301,24 @@ function renderHome() {
       </section>
     </div>`;
 
+  const formatInput = app.querySelector("#tournament-format");
+  const groupCountField = app.querySelector("#group-count-field");
+  const groupCountInput = app.querySelector("#group-count");
+  const teamNamesInput = app.querySelector("#team-names");
+  let groupCountChanged = false;
+  formatInput.addEventListener("change", () => {
+    const isGroups = formatInput.value === "groups_knockout";
+    groupCountField.hidden = !isGroups;
+    groupCountInput.disabled = !isGroups;
+  });
+  groupCountInput.addEventListener("input", () => { groupCountChanged = true; });
+  teamNamesInput.addEventListener("input", () => {
+    if (!groupCountChanged) {
+      const count = teamNamesInput.value.split(/\r?\n/).filter((team) => team.trim()).length;
+      groupCountInput.value = count >= 10 ? "4" : "2";
+    }
+  });
+
   app.querySelector("#create-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
@@ -284,16 +326,20 @@ function renderHome() {
     const teamNames = String(formData.get("teams") || "").split(/\r?\n/).map((team) => team.trim()).filter(Boolean);
     const uniqueNames = new Set(teamNames.map((team) => team.toLocaleLowerCase("it-IT")));
     const format = String(formData.get("format"));
+    const rawGroupCount = String(formData.get("groupCount") || "").trim();
+    const groupCount = Number(rawGroupCount);
     let error = "";
     if (!name) error = "Dai un nome al torneo.";
     else if (teamNames.length < 2) error = "Inserisci almeno 2 squadre.";
     else if (uniqueNames.size !== teamNames.length) error = "Ci sono nomi di squadra duplicati.";
     else if (format === "groups_knockout" && teamNames.length < 4) error = "Per il formato a gironi servono almeno 4 squadre.";
+    else if (format === "groups_knockout" && (!rawGroupCount || !Number.isSafeInteger(groupCount) || groupCount < 2)) error = "Inserisci un numero intero di gironi, almeno 2.";
+    else if (format === "groups_knockout" && groupCount > Math.floor(teamNames.length / 2)) error = "Servono almeno 2 squadre per ogni girone.";
     if (error) {
       app.querySelector("#create-error").textContent = error;
       return;
     }
-    const tournament = makeTournament(name, format, teamNames);
+    const tournament = makeTournament(name, format, teamNames, groupCount);
     tournaments.push(tournament);
     if (saveTournaments()) openTournament(tournament.id);
     else {
