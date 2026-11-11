@@ -300,7 +300,7 @@ function renderHome() {
       tournaments.pop();
       renderHome();
     }
-  });
+  }); 
 
   app.querySelectorAll("[data-open]").forEach((button) => {
     button.addEventListener("click", () => openTournament(button.dataset.open));
