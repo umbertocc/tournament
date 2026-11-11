@@ -167,7 +167,7 @@ function groupLabel(index) {
   return label;
 }
 
-function makeTournament(name, format, teamNames, groupCount) {
+function makeTournament(name, format, teamNames, groupCount, qualifiersPerGroup = 2) {
   const teams = teamNames.map((teamName) => ({ id: createId(), name: teamName }));
   const tournament = {
     id: createId(),
@@ -185,6 +185,7 @@ function makeTournament(name, format, teamNames, groupCount) {
   } else if (format === "knockout") {
     tournament.matches = createKnockoutRounds(teams.map((team) => team.id));
   } else {
+    tournament.qualifiersPerGroup = qualifiersPerGroup;
     const groups = Array.from({ length: groupCount }, (_, index) => {
       const id = groupLabel(index);
       return { id, name: `Girone ${id}`, teamIds: [] };
@@ -244,6 +245,92 @@ function standingsFor(tournament, teamIds, matches) {
     || teamName(tournament, a.teamId).localeCompare(teamName(tournament, b.teamId), "it"));
 }
 
+function qualificationPlan(teamCount, groupCount, qualifiersPerGroup) {
+  const smallestGroup = Math.floor(teamCount / groupCount);
+  if (qualifiersPerGroup > smallestGroup) {
+    return { error: "Ogni girone deve avere almeno tante squadre quante sono le qualificate previste." };
+  }
+  const direct = groupCount * qualifiersPerGroup;
+  const total = 2 ** Math.ceil(Math.log2(direct));
+  const extra = total - direct;
+  const candidates = smallestGroup > qualifiersPerGroup ? groupCount : teamCount % groupCount;
+  if (extra > candidates) {
+    return { error: `Servono ${extra} squadre da ripescare, ma solo ${candidates} gironi hanno una squadra nella posizione successiva. Modifica squadre, gironi o qualificate.` };
+  }
+  return { total, extra };
+}
+
+function qualificationDescription(tournament) {
+  if (tournament.qualifiersPerGroup === undefined) {
+    return "Le prime 2 squadre di ogni girone accedono alla fase finale secondo le regole originali del torneo.";
+  }
+  const count = tournament.qualifiersPerGroup;
+  const plan = qualificationPlan(tournament.teams.length, tournament.groups.length, count);
+  const direct = count === 1
+    ? "La prima squadra di ogni girone accede alla fase finale."
+    : `Le prime ${count} squadre di ogni girone accedono alla fase finale.`;
+  if (!plan.extra) return direct;
+  return `${direct} ${plan.extra === 1 ? "Un'altra squadra viene ripescata" : `Altre ${plan.extra} squadre vengono ripescate`} tra le classificate nella posizione successiva, per punti e differenza reti.`;
+}
+
+function startFinals(tournament, teamIds) {
+  tournament.matches.push(...createKnockoutRounds(teamIds, "finals", 1));
+  tournament.stage = "finals";
+  delete tournament.qualificationPlayoff;
+}
+
+function selectRequalified(tournament, guaranteedIds, rows, spots, playoffRound = 0) {
+  const ranked = [...rows].sort((a, b) => b.points - a.points
+    || (b.goalsFor - b.goalsAgainst) - (a.goalsFor - a.goalsAgainst));
+  const boundary = ranked[spots - 1];
+  const sameScore = (row) => row.points === boundary.points
+    && row.goalsFor - row.goalsAgainst === boundary.goalsFor - boundary.goalsAgainst;
+  const higher = ranked.filter((row) => row.points > boundary.points
+    || (row.points === boundary.points && row.goalsFor - row.goalsAgainst > boundary.goalsFor - boundary.goalsAgainst));
+  const tied = ranked.filter(sameScore);
+  const remainingSpots = spots - higher.length;
+  const qualified = [...guaranteedIds, ...higher.map((row) => row.teamId)];
+  if (tied.length === remainingSpots) {
+    startFinals(tournament, [...qualified, ...tied.map((row) => row.teamId)]);
+    return;
+  }
+  const round = playoffRound + 1;
+  const candidates = tied.map((row) => row.teamId);
+  tournament.qualificationPlayoff = { round, candidates, spots: remainingSpots, qualified };
+  const matches = buildRoundRobin(candidates);
+  matches.forEach((match) => { match.stage = "playoff"; match.playoffRound = round; });
+  tournament.matches.push(...matches);
+  tournament.stage = "playoff";
+}
+
+function finishGroupStage(tournament) {
+  const groupMatches = tournament.matches.filter((match) => match.group && !match.stage);
+  const standings = tournament.groups.map((group) => standingsFor(
+    tournament, group.teamIds, groupMatches.filter((match) => match.group === group.id)
+  ));
+  const count = tournament.qualifiersPerGroup === undefined ? 2 : tournament.qualifiersPerGroup;
+  const qualifiers = standings.flatMap((rows) => rows.slice(0, count).map((row) => row.teamId));
+  if (tournament.qualifiersPerGroup === undefined) {
+    startFinals(tournament, qualifiers);
+    return;
+  }
+  const plan = qualificationPlan(tournament.teams.length, tournament.groups.length, count);
+  if (!plan.extra) {
+    startFinals(tournament, qualifiers);
+    return;
+  }
+  const candidates = standings.map((rows) => rows[count]).filter(Boolean);
+  selectRequalified(tournament, qualifiers, candidates, plan.extra);
+}
+
+function finishPlayoff(tournament) {
+  const playoff = tournament.qualificationPlayoff;
+  const matches = tournament.matches.filter((match) => match.stage === "playoff" && match.playoffRound === playoff.round);
+  if (!matches.every((match) => match.status === "complete")) return;
+  const rows = standingsFor(tournament, playoff.candidates, matches);
+  selectRequalified(tournament, playoff.qualified, rows, playoff.spots, playoff.round);
+}
+
 function renderHome() {
   const totalMatches = tournaments.reduce((sum, tournament) => sum + tournament.matches.length, 0);
   app.innerHTML = `
@@ -277,7 +364,12 @@ function renderHome() {
           <div class="form-field" id="group-count-field" hidden>
             <label for="group-count">Numero di gironi</label>
             <input id="group-count" name="groupCount" type="number" min="2" step="1" value="2" inputmode="numeric" disabled aria-describedby="group-count-hint">
-            <p class="form-hint" id="group-count-hint">Almeno 2 gironi e 2 squadre per girone. Le prime 2 di ogni girone accedono alla fase finale.</p>
+            <p class="form-hint" id="group-count-hint">Almeno 2 gironi e 2 squadre per girone.</p>
+          </div>
+          <div class="form-field" id="qualifiers-field" hidden>
+            <label for="qualifiers-per-group">Squadre qualificate per girone</label>
+            <input id="qualifiers-per-group" name="qualifiersPerGroup" type="number" min="1" step="1" value="2" inputmode="numeric" disabled aria-describedby="qualifiers-hint">
+            <p class="form-hint" id="qualifiers-hint">Se necessario si ripescano le migliori squadre nella posizione successiva, per punti e differenza reti.</p>
           </div>
           <div class="form-field">
             <label for="team-names">Squadre</label>
@@ -304,12 +396,16 @@ function renderHome() {
   const formatInput = app.querySelector("#tournament-format");
   const groupCountField = app.querySelector("#group-count-field");
   const groupCountInput = app.querySelector("#group-count");
+  const qualifiersField = app.querySelector("#qualifiers-field");
+  const qualifiersInput = app.querySelector("#qualifiers-per-group");
   const teamNamesInput = app.querySelector("#team-names");
   let groupCountChanged = false;
   formatInput.addEventListener("change", () => {
     const isGroups = formatInput.value === "groups_knockout";
     groupCountField.hidden = !isGroups;
     groupCountInput.disabled = !isGroups;
+    qualifiersField.hidden = !isGroups;
+    qualifiersInput.disabled = !isGroups;
   });
   groupCountInput.addEventListener("input", () => { groupCountChanged = true; });
   teamNamesInput.addEventListener("input", () => {
@@ -328,6 +424,8 @@ function renderHome() {
     const format = String(formData.get("format"));
     const rawGroupCount = String(formData.get("groupCount") || "").trim();
     const groupCount = Number(rawGroupCount);
+    const rawQualifiers = String(formData.get("qualifiersPerGroup") || "").trim();
+    const qualifiersPerGroup = Number(rawQualifiers);
     let error = "";
     if (!name) error = "Dai un nome al torneo.";
     else if (teamNames.length < 2) error = "Inserisci almeno 2 squadre.";
@@ -335,11 +433,13 @@ function renderHome() {
     else if (format === "groups_knockout" && teamNames.length < 4) error = "Per il formato a gironi servono almeno 4 squadre.";
     else if (format === "groups_knockout" && (!rawGroupCount || !Number.isSafeInteger(groupCount) || groupCount < 2)) error = "Inserisci un numero intero di gironi, almeno 2.";
     else if (format === "groups_knockout" && groupCount > Math.floor(teamNames.length / 2)) error = "Servono almeno 2 squadre per ogni girone.";
+    else if (format === "groups_knockout" && (!rawQualifiers || !Number.isSafeInteger(qualifiersPerGroup) || qualifiersPerGroup < 1)) error = "Inserisci un numero intero di qualificate per girone, almeno 1.";
+    else if (format === "groups_knockout") error = qualificationPlan(teamNames.length, groupCount, qualifiersPerGroup).error || "";
     if (error) {
       app.querySelector("#create-error").textContent = error;
       return;
     }
-    const tournament = makeTournament(name, format, teamNames, groupCount);
+    const tournament = makeTournament(name, format, teamNames, groupCount, qualifiersPerGroup);
     tournaments.push(tournament);
     if (saveTournaments()) openTournament(tournament.id);
     else {
@@ -410,7 +510,14 @@ function renderMatches(tournament) {
       return tournament.groups.map((group) => {
         const matches = tournament.matches.filter((match) => match.group === group.id && !match.stage);
         return `<div class="round-label">${escapeHtml(group.name)}</div><div class="match-list">${matches.map((match) => matchCard(tournament, match, true)).join("")}</div>`;
-      }).join("") + `<div class="section-title"><h2>Passaggio alla fase finale</h2></div><p class="stage-note">Quando tutte le partite dei gironi avranno un risultato, le prime due squadre di ogni girone si qualificheranno automaticamente per l'eliminazione diretta.</p>`;
+      }).join("") + `<div class="section-title"><h2>Passaggio alla fase finale</h2></div><p class="stage-note">${qualificationDescription(tournament)}${tournament.qualifiersPerGroup === undefined ? "" : " In caso di parità decisiva per il ripescaggio si gioca uno spareggio."}</p>`;
+    }
+    if (tournament.stage === "playoff") {
+      const playoff = tournament.qualificationPlayoff;
+      const matches = tournament.matches.filter((match) => match.stage === "playoff" && match.playoffRound === playoff.round);
+      return `<div class="section-title"><h2>Spareggio ripescaggio</h2></div>
+        <p class="stage-note">Parità decisiva per ${playoff.spots} ${playoff.spots === 1 ? "posto" : "posti"}. Le squadre a pari merito si affrontano in un girone di spareggio: non sono ammessi pareggi. Si considerano punti e differenza reti; se la parità decisiva persiste, si gioca un nuovo spareggio.</p>
+        <div class="round-label">Spareggio ${playoff.round}</div><div class="match-list">${matches.map((match) => matchCard(tournament, match, false)).join("")}</div>`;
     }
     const rounds = [...new Set(tournament.matches.filter((match) => match.stage === "finals").map((match) => match.round))].sort((a, b) => a - b);
     return rounds.map((round, index) => {
@@ -427,8 +534,8 @@ function renderStandings(tournament) {
       const matches = tournament.matches.filter((match) => match.group === group.id && !match.stage);
       return `<div class="group-heading">${escapeHtml(group.name)}</div>${standingsTable(tournament, standingsFor(tournament, group.teamIds, matches))}`;
     }).join("");
-    const note = tournament.stage === "groups"
-      ? `<p class="form-hint">Le prime due squadre di ogni girone accedono alla fase finale.</p>`
+    const note = tournament.stage !== "finals"
+      ? `<p class="form-hint">${qualificationDescription(tournament)}${tournament.stage === "playoff" ? " Spareggio di ripescaggio in corso." : ""}</p>`
       : `<div class="group-heading">Fase finale</div>${standingsTable(tournament, standingsFor(tournament, tournament.teams.map((team) => team.id), tournament.matches.filter((match) => match.stage === "finals")))}`;
     return groupsHtml + note;
   }
@@ -437,7 +544,11 @@ function renderStandings(tournament) {
 }
 
 function renderTournament(tournament) {
-  const matches = tournament.matches.filter((match) => tournament.format === "groups_knockout" ? match.stage === "finals" || (!match.stage && tournament.stage === "groups") : true);
+  const matches = tournament.matches.filter((match) => tournament.format === "groups_knockout"
+    ? (tournament.stage === "groups" && !match.stage)
+      || (tournament.stage === "playoff" && match.stage === "playoff" && match.playoffRound === tournament.qualificationPlayoff.round)
+      || (tournament.stage === "finals" && match.stage === "finals")
+    : true);
   const completed = matches.filter((match) => match.status === "complete").length;
   const isComplete = tournament.format === "groups_knockout" ? tournament.stage === "finals" && tournament.matches.filter((match) => match.stage === "finals").every((match) => match.status === "complete") : matches.every((match) => match.status === "complete");
   app.innerHTML = `
@@ -512,6 +623,7 @@ function saveScore(tournament, card) {
   if (!match || !match.team1Id || !match.team2Id) return;
   const previousMatches = tournament.matches.map((entry) => ({ ...entry }));
   const previousStage = tournament.stage;
+  const previousPlayoff = tournament.qualificationPlayoff;
   const firstInput = card.querySelector('[data-score="1"]');
   const secondInput = card.querySelector('[data-score="2"]');
   if (firstInput.value === "" && secondInput.value === "") {
@@ -539,8 +651,8 @@ function saveScore(tournament, card) {
     render();
     return;
   }
-  if ((tournament.format === "knockout" || match.stage === "finals") && score1 === score2) {
-    showToast("In eliminazione diretta non può esserci un pareggio.");
+  if ((tournament.format === "knockout" || match.stage === "finals" || match.stage === "playoff") && score1 === score2) {
+    showToast(match.stage === "playoff" ? "Nello spareggio non può esserci un pareggio." : "In eliminazione diretta non può esserci un pareggio.");
     render();
     return;
   }
@@ -551,29 +663,22 @@ function saveScore(tournament, card) {
   if (tournament.format === "groups_knockout" && tournament.stage === "groups") {
     const groupMatches = tournament.matches.filter((entry) => entry.group && !entry.stage);
     if (groupMatches.every((entry) => entry.status === "complete")) {
-      const qualifiers = tournament.groups.flatMap((group) => standingsFor(
-        tournament,
-        group.teamIds,
-        groupMatches.filter((entry) => entry.group === group.id)
-      ).slice(0, 2).map((row) => row.teamId));
-      const finals = createKnockoutRounds(qualifiers, "finals", 1);
-      tournament.matches.push(...finals);
-      tournament.stage = "finals";
-      if (!saveTournaments()) {
-        tournament.matches = previousMatches;
-        tournament.stage = previousStage;
-        render();
-        return;
-      }
-      render();
-      showToast("Gironi completati! La fase finale è pronta.");
-      return;
+      finishGroupStage(tournament);
+    }
+  } else if (tournament.stage === "playoff" && match.stage === "playoff") {
+    finishPlayoff(tournament);
+  }
+  if (saveTournaments()) {
+    render();
+    if (tournament.stage !== previousStage || (tournament.stage === "playoff" && tournament.qualificationPlayoff !== previousPlayoff)) {
+      showToast(tournament.stage === "finals" ? "La fase finale è pronta." : "È necessario uno spareggio per il ripescaggio.");
     }
   }
-  if (saveTournaments()) render();
   else {
     tournament.matches = previousMatches;
     tournament.stage = previousStage;
+    if (previousPlayoff) tournament.qualificationPlayoff = previousPlayoff;
+    else delete tournament.qualificationPlayoff;
     render();
   }
 }

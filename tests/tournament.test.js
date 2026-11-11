@@ -23,7 +23,7 @@ function loadApp() {
   });
   const source = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   vm.runInContext(source, context);
-  return vm.runInContext("({ makeTournament, createKnockoutRounds, advanceWinners, groupLabel })", context);
+  return vm.runInContext("({ makeTournament, createKnockoutRounds, advanceWinners, groupLabel, qualificationPlan, finishGroupStage, finishPlayoff, selectRequalified })", context);
 }
 
 test("distribuisce le squadre nei gironi scelti e genera le partite", () => {
@@ -89,4 +89,95 @@ test("i tabelloni salvati con uno slot vuoto attendono i risultati mancanti", ()
   assert.equal(final.team2Id, null);
   assert.equal(final.status, "pending");
   assert.equal(final.score1, null);
+});
+
+test("valida i posti diretti e quelli disponibili per il ripescaggio", () => {
+  const { qualificationPlan } = loadApp();
+  assert.equal(qualificationPlan(9, 3, 2).total, 8);
+  assert.equal(qualificationPlan(9, 3, 2).extra, 2);
+  assert.ok(qualificationPlan(6, 3, 2).error.includes("solo 0"));
+  assert.ok(qualificationPlan(12, 3, 3).error.includes("solo 3"));
+  assert.ok(qualificationPlan(8, 3, 3).error.includes("Ogni girone"));
+  assert.ok(qualificationPlan(12, 4, 3).error);
+  assert.equal(qualificationPlan(8, 2, 3).total, 8);
+  assert.equal(qualificationPlan(8, 2, 3).extra, 2);
+});
+
+test("il ripescaggio confronta punti e differenza reti totali", () => {
+  const { makeTournament, selectRequalified } = loadApp();
+  const tournament = makeTournament("Coppa", "groups_knockout",
+    ["A", "B", "C", "D", "E", "F", "G", "H", "I"], 3, 2);
+  const ids = tournament.teams.map((team) => team.id);
+  const rows = [
+    { teamId: ids[6], points: 2, goalsFor: 4, goalsAgainst: 5 },
+    { teamId: ids[7], points: 1, goalsFor: 9, goalsAgainst: 2 },
+    { teamId: ids[8], points: 2, goalsFor: 1, goalsAgainst: 1 }
+  ];
+  selectRequalified(tournament, ids.slice(0, 6), rows, 2);
+  const firstRound = tournament.matches.filter((match) => match.stage === "finals" && match.round === 1);
+  const finalists = firstRound.flatMap((match) => [match.team1Id, match.team2Id]);
+  assert.equal(tournament.stage, "finals");
+  assert.equal(firstRound.length, 4);
+  assert.ok(finalists.includes(ids[6]));
+  assert.ok(finalists.includes(ids[8]));
+  assert.ok(!finalists.includes(ids[7]));
+  assert.ok(firstRound.every((match) => match.team1Id && match.team2Id && match.status === "pending"));
+});
+
+test("la parità decisiva avvia e ripete lo spareggio fino a scegliere le ripescate", () => {
+  const { makeTournament, finishGroupStage, finishPlayoff } = loadApp();
+  const tournament = makeTournament("Coppa", "groups_knockout",
+    ["A", "B", "C", "D", "E", "F", "G", "H", "I"], 3, 2);
+  for (const match of tournament.matches) {
+    match.score1 = 1;
+    match.score2 = 0;
+    match.status = "complete";
+  }
+  finishGroupStage(tournament);
+  assert.equal(tournament.stage, "playoff");
+  assert.equal(tournament.qualificationPlayoff.candidates.length, 3);
+  assert.equal(tournament.qualificationPlayoff.spots, 2);
+  let matches = tournament.matches.filter((match) => match.stage === "playoff" && match.playoffRound === 1);
+  assert.equal(matches.length, 3);
+
+  const candidates = tournament.qualificationPlayoff.candidates;
+  for (const match of matches) {
+    const first = candidates.indexOf(match.team1Id);
+    const second = candidates.indexOf(match.team2Id);
+    const firstWins = (first + 1) % 3 === second;
+    match.score1 = firstWins ? 1 : 0;
+    match.score2 = firstWins ? 0 : 1;
+    match.status = "complete";
+  }
+  finishPlayoff(tournament);
+  assert.equal(tournament.stage, "playoff");
+  assert.equal(tournament.qualificationPlayoff.round, 2);
+  matches = tournament.matches.filter((match) => match.stage === "playoff" && match.playoffRound === 2);
+  for (const match of matches) {
+    const firstWins = candidates.indexOf(match.team1Id) < candidates.indexOf(match.team2Id);
+    match.score1 = firstWins ? 2 : 0;
+    match.score2 = firstWins ? 0 : 2;
+    match.status = "complete";
+  }
+  finishPlayoff(tournament);
+  const finals = tournament.matches.filter((match) => match.stage === "finals" && match.round === 1);
+  assert.equal(tournament.stage, "finals");
+  assert.equal(finals.length, 4);
+  assert.ok(finals.every((match) => match.team1Id && match.team2Id));
+  assert.equal(tournament.qualificationPlayoff, undefined);
+});
+
+test("i tornei esistenti conservano la regola precedente", () => {
+  const { makeTournament, finishGroupStage } = loadApp();
+  const tournament = makeTournament("Storico", "groups_knockout",
+    ["A", "B", "C", "D", "E", "F"], 3);
+  delete tournament.qualifiersPerGroup;
+  for (const match of tournament.matches) {
+    match.score1 = 1;
+    match.score2 = 0;
+    match.status = "complete";
+  }
+  finishGroupStage(tournament);
+  assert.equal(tournament.stage, "finals");
+  assert.equal(tournament.matches.filter((match) => match.stage === "finals" && match.round === 1 && match.status === "complete").length, 2);
 });
